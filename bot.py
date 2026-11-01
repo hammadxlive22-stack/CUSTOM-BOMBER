@@ -84,12 +84,12 @@ def default_reply_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-MAIN_OWNER = 8710308658
+MAIN_OWNER = 6320870476
 SUPER_ADMIN_NAME = "@HAMMADPAPA"
 SUPER_ADMIN_LINK = "https://t.me/papajihammad"
 SUPER_ADMINS = [6320870476]
 
-BOT_TOKEN = "9260236550:AAEXhMNm3d5jOfmjLDDl98BI8sSmuOVptnY"
+BOT_TOKEN = os.getenv("9260236550:AAGEmGQTREUwOb4YYXX9VYSuLYaThp8K3Ns", "").strip()
 LOG_CHANNEL_ID = -1002956245828
 
 _DATA_FILE = "blast_data.json"
@@ -689,7 +689,9 @@ def owner_panel_text(d: dict) -> str:
     for fb_id, fb_data in FB_DEVICE_COUNTS.items():
         age = int(time.time() - fb_data.get("last_update", 0))
         status = em(EMOJI_CHECK, "🟢") if age < 60 else em(EMOJI_WARNING, "🟡") if age < 300 else em(EMOJI_CROSS, "🔴")
-        fb_lines.append(f"  {status} {fb_data['label'][:20]}: {fb_data['online']} ᴏɴʟɪɴᴇ")
+        label = str(fb_data.get("label") or fb_id)[:20]
+        online = fb_data.get("online", 0)
+        fb_lines.append(f"  {status} {label}: {online} ᴏɴʟɪɴᴇ")
     fb_summary = "\n".join(fb_lines) if fb_lines else f"  {em(EMOJI_WARNING, '😴')} ɴᴏ ᴅᴀᴛᴀ"
 
     protected_count = len(PROTECTED_NUMBERS)
@@ -728,7 +730,9 @@ def admin_panel_text(d: dict) -> str:
     for fb_id, fb_data in FB_DEVICE_COUNTS.items():
         age = int(time.time() - fb_data.get("last_update", 0))
         status = em(EMOJI_CHECK, "🟢") if age < 60 else em(EMOJI_WARNING, "🟡") if age < 300 else em(EMOJI_CROSS, "🔴")
-        fb_lines.append(f"  {status} {fb_data['label'][:20]}: {fb_data['online']} ᴏɴʟɪɴᴇ")
+        label = str(fb_data.get("label") or fb_id)[:20]
+        online = fb_data.get("online", 0)
+        fb_lines.append(f"  {status} {label}: {online} ᴏɴʟɪɴᴇ")
     fb_summary = "\n".join(fb_lines) if fb_lines else f"  {em(EMOJI_WARNING, '😴')} ɴᴏ ᴅᴀᴛᴀ"
 
     protected_count = len(PROTECTED_NUMBERS)
@@ -937,6 +941,59 @@ def api_stats_text(d: dict) -> str:
         lines.append(f"{em(EMOJI_FIRE, '🔥')} {label}\n   {em(EMOJI_CHECK, '✅')} {sent} sᴇɴᴛ  {em(EMOJI_CROSS, '❌')} {failed} ғᴀɪʟᴇᴅ")
     return "\n".join(lines)
 
+def _telegram_text_chunks(text: str, limit: int = 3800) -> list[str]:
+    """Split panel HTML on line boundaries below Telegram's 4096-char limit.
+
+    Panel content is line-oriented HTML (each formatting tag opens/closes on
+    the same line), so joining complete lines keeps every HTML entity valid.
+    No panel rows or Firebase records are discarded.
+    """
+    text = str(text or "")
+    if not text:
+        return [" "]
+    lines = text.splitlines(keepends=True)
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        # Telegram counts UTF-16 code units for message length.
+        line_len = len(line.encode("utf-16-le")) // 2
+        if line_len > limit:
+            # Current panel lines are intentionally short. Fail loudly rather
+            # than silently corrupting an HTML tag if a future line is huge.
+            raise ValueError("A single panel line exceeds the safe Telegram message limit")
+        current_len = len(current.encode("utf-16-le")) // 2
+        if current and current_len + line_len > limit:
+            chunks.append(current.rstrip("\n"))
+            current = ""
+        current += line
+    if current:
+        chunks.append(current.rstrip("\n"))
+    return chunks or [" "]
+
+
+async def show_panel(message: Message, text: str, reply_markup: InlineKeyboardMarkup, *, edit: bool = False) -> None:
+    """Send/edit a full owner/admin panel without losing text or buttons."""
+    chunks = _telegram_text_chunks(text)
+    # Keep the original panel controls on the first (main) message. Extra
+    # text chunks are plain continuation messages, so existing inline-button
+    # navigation remains attached to the panel users interact with.
+    if edit:
+        try:
+            await message.edit_text(chunks[0], reply_markup=reply_markup, parse_mode="HTML")
+        except TelegramBadRequest as exc:
+            # A refresh can legitimately produce identical text. Continue
+            # sending any remaining chunks; do not hide unrelated failures.
+            if "message is not modified" not in str(exc).lower():
+                raise
+        start_at = 1
+    else:
+        await message.answer(chunks[0], reply_markup=reply_markup, parse_mode="HTML")
+        start_at = 1
+
+    for index in range(start_at, len(chunks)):
+        await message.answer(chunks[index], parse_mode="HTML")
+
+
 R = Router()
 
 @R.message(CommandStart(deep_link=True))
@@ -987,10 +1044,10 @@ async def cmd_start_deep(msg: Message, state: FSMContext):
     await send_random_video(msg.bot, msg.chat.id, caption=f"{em(EMOJI_ROCKET, '🚀')} Welcome to SMS Blast Bot!\nOwner: {SUPER_ADMIN_NAME}\nManager: @Titanium_Ansh")
 
     if is_owner(uid, d):
-        await msg.answer(owner_panel_text(d), reply_markup=owner_kb(d), parse_mode="HTML")
+        await show_panel(msg, owner_panel_text(d), owner_kb(d))
         return
     if is_admin(uid, d):
-        await msg.answer(admin_panel_text(d), reply_markup=admin_kb(d), parse_mode="HTML")
+        await show_panel(msg, admin_panel_text(d), admin_kb(d))
         return
     if is_banned(uid, d):
         await msg.answer(f"{em(EMOJI_CROSS, '🚫')} <b>Aapko ban kar diya gaya hai.</b>\nAdmin se contact karein.", parse_mode="HTML")
@@ -1031,10 +1088,10 @@ async def cmd_start(msg: Message, state: FSMContext):
     await send_random_video(msg.bot, msg.chat.id, caption=f"{em(EMOJI_ROCKET, '🚀')} Welcome to SMS Blast Bot!\nOwner: {SUPER_ADMIN_NAME}")
 
     if is_owner(uid, d):
-        await msg.answer(owner_panel_text(d), reply_markup=owner_kb(d), parse_mode="HTML")
+        await show_panel(msg, owner_panel_text(d), owner_kb(d))
         return
     if is_admin(uid, d):
-        await msg.answer(admin_panel_text(d), reply_markup=admin_kb(d), parse_mode="HTML")
+        await show_panel(msg, admin_panel_text(d), admin_kb(d))
         return
     if is_banned(uid, d):
         await msg.answer(f"{em(EMOJI_CROSS, '🚫')} <b>Aapko ban kar diya gaya hai.</b>\nAdmin se contact karein.", parse_mode="HTML")
@@ -1061,9 +1118,9 @@ async def fj_check(cq: CallbackQuery, state: FSMContext):
     await send_random_video(cq.bot, cq.message.chat.id, caption=f"{em(EMOJI_ROCKET, '🚀')} Welcome! Verified Successfully.\nOwner: {SUPER_ADMIN_NAME}")
 
     if is_owner(uid, d):
-        await cq.message.answer(owner_panel_text(d), reply_markup=owner_kb(d), parse_mode="HTML")
+        await show_panel(cq.message, owner_panel_text(d), owner_kb(d))
     elif is_admin(uid, d):
-        await cq.message.answer(admin_panel_text(d), reply_markup=admin_kb(d), parse_mode="HTML")
+        await show_panel(cq.message, admin_panel_text(d), admin_kb(d))
     else:
         await cq.message.answer(user_home_text(uid, d), reply_markup=user_kb(), parse_mode="HTML")
 
@@ -2213,7 +2270,7 @@ async def owner_home(cq: CallbackQuery, state: FSMContext):
         await cq.answer("🚫 Owner Only!", show_alert=True)
         return
     try:
-        await cq.message.edit_text(owner_panel_text(d), reply_markup=owner_kb(d), parse_mode="HTML")
+        await show_panel(cq.message, owner_panel_text(d), owner_kb(d), edit=True)
     except TelegramBadRequest:
         pass
 
@@ -2607,7 +2664,7 @@ async def owner_free_toggle(cq: CallbackQuery, state: FSMContext):
     mode = "🟢 FREE MODE ON" if d["free_mode"] else "🔴 Approval Required"
     await cq.answer(f"Done! {mode}", show_alert=True)
     try:
-        await cq.message.edit_text(owner_panel_text(d), reply_markup=owner_kb(d), parse_mode="HTML")
+        await show_panel(cq.message, owner_panel_text(d), owner_kb(d), edit=True)
     except TelegramBadRequest: pass
 
 @R.callback_query(F.data.in_({"owner:users:list", "admin:users:list"}))
@@ -2709,7 +2766,7 @@ async def panel_unban_do(cq: CallbackQuery, state: FSMContext):
     await cq.answer(f"✅ {ban_id} unban ho gaya!", show_alert=True)
     back_text = owner_panel_text(d) if is_owner(uid, d) else admin_panel_text(d)
     back_kb = owner_kb(d) if is_owner(uid, d) else admin_kb(d)
-    await cq.message.edit_text(back_text, reply_markup=back_kb, parse_mode="HTML")
+    await show_panel(cq.message, back_text, back_kb, edit=True)
     try:
         await cq.bot.send_message(ban_id, f"{em(EMOJI_CHECK, '✅')} Aapka ban hata diya gaya. /start karein.", parse_mode="HTML")
     except: pass
@@ -2789,7 +2846,7 @@ async def admin_home(cq: CallbackQuery, state: FSMContext):
         await cq.answer("🚫 Admin Only!", show_alert=True)
         return
     try:
-        await cq.message.edit_text(admin_panel_text(d), reply_markup=admin_kb(d), parse_mode="HTML")
+        await show_panel(cq.message, admin_panel_text(d), admin_kb(d), edit=True)
     except TelegramBadRequest: pass
 
 @R.callback_query(F.data == "admin:stats")
@@ -3495,10 +3552,10 @@ async def user_home(cq: CallbackQuery, state: FSMContext):
         return
 
     if is_owner(uid, d):
-        await cq.message.edit_text(owner_panel_text(d), reply_markup=owner_kb(d), parse_mode="HTML")
+        await show_panel(cq.message, owner_panel_text(d), owner_kb(d), edit=True)
         return
     if is_admin(uid, d):
-        await cq.message.edit_text(admin_panel_text(d), reply_markup=admin_kb(d), parse_mode="HTML")
+        await show_panel(cq.message, admin_panel_text(d), admin_kb(d), edit=True)
         return
     if not can_use(uid, d):
         await cq.message.edit_text(f"{em(EMOJI_CROSS, '⛔')} Access nahi hai!", parse_mode="HTML")
@@ -3651,6 +3708,8 @@ async def noop(cq: CallbackQuery):
     await cq.answer()
 
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is not set in Railway Variables")
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(R)
