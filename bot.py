@@ -89,7 +89,7 @@ SUPER_ADMIN_NAME = "@HAMMADPAPA"
 SUPER_ADMIN_LINK = "https://t.me/papajihammad"
 SUPER_ADMINS = [6320870476]
 
-BOT_TOKEN = os.getenv("9260236550:AAGEmGQTREUwOb4YYXX9VYSuLYaThp8K3Ns", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 LOG_CHANNEL_ID = -1002956245828
 
 _DATA_FILE = "blast_data.json"
