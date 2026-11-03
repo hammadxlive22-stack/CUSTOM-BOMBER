@@ -821,7 +821,6 @@ def videos_menu_kb(d: dict) -> InlineKeyboardMarkup:
     rows.append([btn("ʙᴀᴄᴋ", "owner:home", EMOJI_GEAR, "🔙")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# Fixed: Firebase menu keyboard with pagination to avoid "reply markup too long"
 def fb_menu_kb(d: dict, page: int = 0) -> InlineKeyboardMarkup:
     fbs = d.get("firebases", [])
     per_page = 8
@@ -942,12 +941,6 @@ def api_stats_text(d: dict) -> str:
     return "\n".join(lines)
 
 def _telegram_text_chunks(text: str, limit: int = 3800) -> list[str]:
-    """Split panel HTML on line boundaries below Telegram's 4096-char limit.
-
-    Panel content is line-oriented HTML (each formatting tag opens/closes on
-    the same line), so joining complete lines keeps every HTML entity valid.
-    No panel rows or Firebase records are discarded.
-    """
     text = str(text or "")
     if not text:
         return [" "]
@@ -955,11 +948,8 @@ def _telegram_text_chunks(text: str, limit: int = 3800) -> list[str]:
     chunks: list[str] = []
     current = ""
     for line in lines:
-        # Telegram counts UTF-16 code units for message length.
         line_len = len(line.encode("utf-16-le")) // 2
         if line_len > limit:
-            # Current panel lines are intentionally short. Fail loudly rather
-            # than silently corrupting an HTML tag if a future line is huge.
             raise ValueError("A single panel line exceeds the safe Telegram message limit")
         current_len = len(current.encode("utf-16-le")) // 2
         if current and current_len + line_len > limit:
@@ -970,19 +960,12 @@ def _telegram_text_chunks(text: str, limit: int = 3800) -> list[str]:
         chunks.append(current.rstrip("\n"))
     return chunks or [" "]
 
-
 async def show_panel(message: Message, text: str, reply_markup: InlineKeyboardMarkup, *, edit: bool = False) -> None:
-    """Send/edit a full owner/admin panel without losing text or buttons."""
     chunks = _telegram_text_chunks(text)
-    # Keep the original panel controls on the first (main) message. Extra
-    # text chunks are plain continuation messages, so existing inline-button
-    # navigation remains attached to the panel users interact with.
     if edit:
         try:
             await message.edit_text(chunks[0], reply_markup=reply_markup, parse_mode="HTML")
         except TelegramBadRequest as exc:
-            # A refresh can legitimately produce identical text. Continue
-            # sending any remaining chunks; do not hide unrelated failures.
             if "message is not modified" not in str(exc).lower():
                 raise
         start_at = 1
@@ -992,7 +975,6 @@ async def show_panel(message: Message, text: str, reply_markup: InlineKeyboardMa
 
     for index in range(start_at, len(chunks)):
         await message.answer(chunks[index], parse_mode="HTML")
-
 
 R = Router()
 
@@ -1053,7 +1035,7 @@ async def cmd_start_deep(msg: Message, state: FSMContext):
         await msg.answer(f"{em(EMOJI_CROSS, '🚫')} <b>Aapko ban kar diya gaya hai.</b>\nAdmin se contact karein.", parse_mode="HTML")
         return
     if not can_use(uid, d):
-        await msg.answer(f"{em(EMOJI_CROSS, '⛔')} <b>Access nahi hai!</b>\n\nOwner se approval lein. Sahilxalone.t.me ", parse_mode="HTML")
+        await msg.answer(f"{em(EMOJI_CROSS, '⛔')} <b>Access nahi hai!</b>\n\nOwner se approval lein.", parse_mode="HTML")
         return
 
     await msg.answer(user_home_text(uid, d), reply_markup=user_kb(), parse_mode="HTML")
@@ -1461,6 +1443,7 @@ async def admin_got_count(msg: Message, state: FSMContext):
         return
     await run_sms_blast_with_progress(msg.bot, msg, msg.from_user.id, number, message_text, count, devices, send_speed)
 
+# HIGH-CONCURRENCY WORKER POOL & QUEUE IMPLEMENTATION
 async def run_sms_blast_with_progress(bot: Bot, msg: Message, uid: int, number: str, message: str, count: int, devices: list, speed: float = SPEED_DEFAULT):
     await send_random_video(bot, msg.chat.id, caption=f"💣 <b>SMS Bombing Started on {mask_number(number)}!</b>")
 
@@ -1482,7 +1465,6 @@ async def run_sms_blast_with_progress(bot: Bot, msg: Message, uid: int, number: 
 
     is_regular_user = not is_admin(uid, load()) and not is_owner(uid, load())
     current_credits = get_user_credits(uid, load()) if is_regular_user else None
-
     speed_label_display = "🚀 FAST" if speed == SPEED_FAST else "⚡ MEDIUM" if speed == SPEED_MEDIUM else "🐢 SLOW"
 
     try:
@@ -1500,138 +1482,123 @@ async def run_sms_blast_with_progress(bot: Bot, msg: Message, uid: int, number: 
 
     sent_ok = 0
     sent_fail = 0
-    msgs_left = count
     api_usage_delta = {}
-    last_update_time = time.time()
     start_time = time.time()
+    last_update_time = time.time()
 
-    async def do_send():
-        nonlocal sent_ok, sent_fail, msgs_left, last_update_time
-        try:
-            for device in devices:
-                if msgs_left <= 0:
-                    break
+    job_queue = asyncio.Queue()
+    for _ in range(count):
+        await job_queue.put(1)
 
-                async with session.lock:
-                    if session.cancelled:
-                        log.info(f"User {uid} stopped sending at {sent_ok + sent_fail}/{count}")
-                        break
-
-                fb_id = device["fb_id"]
-                fb_url = device["fb_url"]
-                dev_id = device["dev_id"]
-                sims = device["sims"]
-                sim_slots = [s.get("simSlotIndex", 0) for s in sims] if sims else [0]
-                device_quota = min(3, msgs_left)
-                device_sent = 0
-
-                for sim in sim_slots:
-                    async with session.lock:
-                        if device_sent >= device_quota or msgs_left <= 0 or session.cancelled:
-                            break
-
-                    ok = await send_sms_via_device(fb_url, dev_id, sim, number, message)
-
-                    async with session.lock:
-                        if ok:
-                            sent_ok += 1
-                            device_sent += 1
-                            msgs_left -= 1
-
-                            if is_regular_user:
-                                d_temp = load()
-                                deduct_credits(uid, 1, d_temp)
-                                d_temp["stats"]["total_sent"] = d_temp["stats"].get("total_sent", 0) + 1
-                                k = str(uid)
-                                if k in d_temp["users"]:
-                                    d_temp["users"][k]["uses"] = d_temp["users"][k].get("uses", 0) + 1
-                                d_temp.setdefault("sms_history", {}).setdefault(str(uid), []).append({
-                                    "number": number,
-                                    "message": message[:100],
-                                    "timestamp": int(time.time()),
-                                    "status": "sent"
-                                })
-                                save(d_temp)
-                        else:
-                            sent_fail += 1
-                            msgs_left -= 1
-
-                        if fb_id not in api_usage_delta:
-                            api_usage_delta[fb_id] = {"sent": 0, "failed": 0}
-                        api_usage_delta[fb_id]["sent" if ok else "failed"] += 1
-
-                        now = time.time()
-                        if (now - last_update_time >= _PROGRESS_UPDATE_INTERVAL or
-                            (sent_ok + sent_fail) == count or
-                            session.cancelled):
-
-                            current_credits_live = get_user_credits(uid, load()) if is_regular_user else None
-                            try:
-                                await progress_msg.edit_text(
-                                    progress_text(sent_ok, sent_fail, count, current_credits_live, speed_label_display),
-                                    reply_markup=stop_send_kb() if not session.cancelled else None,
-                                    parse_mode="HTML"
-                                )
-                            except TelegramBadRequest:
-                                pass
-                            last_update_time = now
-
-                    await asyncio.sleep(speed)
-
-        except Exception as e:
-            log.error(f"Error in send loop for user {uid}: {e}")
-        finally:
+    async def worker(worker_id: int):
+        nonlocal sent_ok, sent_fail, last_update_time
+        while not job_queue.empty():
             async with session.lock:
+                if session.cancelled:
+                    break
+            try:
+                await job_queue.get()
+            except asyncio.QueueEmpty:
+                break
+
+            device = random.choice(devices)
+            fb_id = device["fb_id"]
+            fb_url = device["fb_url"]
+            dev_id = device["dev_id"]
+            sims = device["sims"]
+            sim_slot = random.choice([s.get("simSlotIndex", 0) for s in sims]) if sims else 0
+
+            ok = await send_sms_via_device(fb_url, dev_id, sim_slot, number, message)
+
+            async with session.lock:
+                if ok:
+                    sent_ok += 1
+                    if is_regular_user:
+                        d_temp = load()
+                        deduct_credits(uid, 1, d_temp)
+                        d_temp["stats"]["total_sent"] = d_temp["stats"].get("total_sent", 0) + 1
+                        k = str(uid)
+                        if k in d_temp["users"]:
+                            d_temp["users"][k]["uses"] = d_temp["users"][k].get("uses", 0) + 1
+                        d_temp.setdefault("sms_history", {}).setdefault(str(uid), []).append({
+                            "number": number,
+                            "message": message[:100],
+                            "timestamp": int(time.time()),
+                            "status": "sent"
+                        })
+                        save(d_temp)
+                else:
+                    sent_fail += 1
+
+                if fb_id not in api_usage_delta:
+                    api_usage_delta[fb_id] = {"sent": 0, "failed": 0}
+                api_usage_delta[fb_id]["sent" if ok else "failed"] += 1
+
                 session.sent = sent_ok
                 session.failed = sent_fail
 
-    task = asyncio.create_task(do_send())
-    session.task = task
-    await task
+            if speed > 0:
+                await asyncio.sleep(speed)
+
+            now = time.time()
+            if now - last_update_time >= 1.5 or (sent_ok + sent_fail) >= count or session.cancelled:
+                last_update_time = now
+                current_credits_live = get_user_credits(uid, load()) if is_regular_user else None
+                try:
+                    await progress_msg.edit_text(
+                        progress_text(sent_ok, sent_fail, count, current_credits_live, speed_label_display),
+                        reply_markup=stop_send_kb() if not session.cancelled else None,
+                        parse_mode="HTML"
+                    )
+                except TelegramBadRequest:
+                    pass
+            job_queue.task_done()
+
+    concurrency_workers = min(50, max(5, len(devices) * 3))
+    workers = [asyncio.create_task(worker(i)) for i in range(concurrency_workers)]
+    session.task = asyncio.gather(*workers)
+    
+    try:
+        await session.task
+    except Exception as e:
+        log.error(f"Worker pool execution error: {e}")
+
     was_cancelled = session.cancelled
 
     async with SESSIONS_LOCK:
         if uid in USER_SESSIONS:
             del USER_SESSIONS[uid]
 
+    d_final = load()
+    d_final["stats"]["total_sent"] = d_final["stats"].get("total_sent", 0) + sent_ok
+    d_final["stats"]["total_failed"] = d_final["stats"].get("total_failed", 0) + sent_fail
+    for fb_id, delta in api_usage_delta.items():
+        d_final["stats"].setdefault("api_usage", {}).setdefault(fb_id, {"sent": 0, "failed": 0})
+        d_final["stats"]["api_usage"][fb_id]["sent"] += delta["sent"]
+        d_final["stats"]["api_usage"][fb_id]["failed"] += delta["failed"]
+    
     if not is_regular_user:
-        d_final = load()
-        d_final["stats"]["total_sent"] = d_final["stats"].get("total_sent", 0) + sent_ok
-        d_final["stats"]["total_failed"] = d_final["stats"].get("total_failed", 0) + sent_fail
-        for fb_id, delta in api_usage_delta.items():
-            d_final["stats"].setdefault("api_usage", {}).setdefault(fb_id, {"sent": 0, "failed": 0})
-            d_final["stats"]["api_usage"][fb_id]["sent"] += delta["sent"]
-            d_final["stats"]["api_usage"][fb_id]["failed"] += delta["failed"]
         k = str(uid)
         if k in d_final["users"]:
             d_final["users"][k]["uses"] = d_final["users"][k].get("uses", 0) + sent_ok
-        d_final.setdefault("sms_history", {}).setdefault(str(uid), []).append({
-            "number": number,
-            "message": message[:100],
-            "timestamp": int(time.time()),
-            "status": "completed" if not was_cancelled else "stopped"
-        })
-        save(d_final)
-    else:
-        d_final = load()
-        d_final["stats"]["total_failed"] = d_final["stats"].get("total_failed", 0) + sent_fail
-        for fb_id, delta in api_usage_delta.items():
-            d_final["stats"].setdefault("api_usage", {}).setdefault(fb_id, {"sent": 0, "failed": 0})
-            d_final["stats"]["api_usage"][fb_id]["failed"] += delta["failed"]
-        save(d_final)
 
-    d_log = load()
+    d_final.setdefault("sms_history", {}).setdefault(str(uid), []).append({
+        "number": number,
+        "message": message[:100],
+        "timestamp": int(time.time()),
+        "status": "completed" if not was_cancelled else "stopped"
+    })
+    save(d_final)
+
     duration = int(time.time() - start_time)
-    log_activity(d_log, "sms_blast", uid,
-        f"Sent: {sent_ok}, Failed: {sent_fail}, Total: {count}, Duration: {fmt_duration(duration)}, Stopped: {was_cancelled}")
-    save(d_log)
+    log_activity(d_final, "sms_blast", uid, f"Sent: {sent_ok}, Failed: {sent_fail}, Total: {count}, Duration: {fmt_duration(duration)}")
 
     try:
         user_chat_info = await bot.get_chat(uid)
         u_name = user_chat_info.full_name or "Unknown"
         u_uname = f"@{user_chat_info.username}" if user_chat_info.username else "No Username"
     except Exception:
-        u_name = d_log.get("users", {}).get(str(uid), {}).get("name", "Unknown")
+        u_name = "Unknown"
         u_uname = "No Username"
 
     chan_log = (
@@ -1640,51 +1607,31 @@ async def run_sms_blast_with_progress(bot: Bot, msg: Message, uid: int, number: 
         f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
         f"🌐 <b>Username:</b> {u_uname}\n"
         f"📞 <b>Target Number:</b> <code>{number}</code>\n"
-        f"💬 <b>Message:</b> <code>{message}</code>\n"
         f"✅ <b>Sent:</b> <b>{sent_ok}</b>\n"
         f"❌ <b>Failed:</b> <b>{sent_fail}</b>\n"
         f"📊 <b>Requested Count:</b> <b>{count}</b>\n"
-        f"⏱ <b>Duration:</b> <b>{fmt_duration(duration)}</b>\n"
-        f"🛑 <b>Status:</b> {'STOPPED BY USER' if was_cancelled else 'COMPLETED'}"
+        f"⏱ <b>Duration:</b> <b>{fmt_duration(duration)}</b>"
     )
     asyncio.create_task(send_channel_log(bot, chan_log))
 
-    if sent_fail == 0 and sent_ok > 0:
-        icon = em(EMOJI_CHECK, "✅")
-    elif sent_ok > 0:
-        icon = em(EMOJI_WARNING, "⚠️")
-    else:
-        icon = em(EMOJI_CROSS, "❌")
+    icon = em(EMOJI_CHECK, "✅") if sent_fail == 0 else em(EMOJI_WARNING, "⚠️")
+    credit_text = f"\n{em(EMOJI_MONEY, '💳')} Remaining Credits: <b>{get_user_credits(uid, load())}</b>" if is_regular_user else ""
+    stopped_text = f"\n{em(EMOJI_CROSS, '🛑')} <b>Stopped by user!</b>" if was_cancelled else ""
 
-    credit_text = ""
-    if is_regular_user:
-        remaining = get_user_credits(uid, load())
-        credit_text = f"\n{em(EMOJI_MONEY, '💰')} Credits Used: <b>{sent_ok}</b>\n{em(EMOJI_MONEY, '💳')} Remaining: <b>{remaining}</b>"
-
-    stopped_text = f"\n{em(EMOJI_CROSS, '🛑')} <b>User ne beech mein stop kiya!</b>" if was_cancelled else ""
-    duration_text = f"\n{em(EMOJI_GEAR, '⏱')} Duration: <b>{fmt_duration(int(time.time() - start_time))}</b>"
-
-    if is_owner(uid, load()):
-        back_btn = [btn("ᴏᴡɴᴇʀ ᴘᴀɴᴇʟ", "owner:home", EMOJI_GEAR, "🔙")]
-    elif is_admin(uid, load()):
-        back_btn = [btn("ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ", "admin:home", EMOJI_GEAR, "🔙")]
-    else:
-        back_btn = [btn("sᴇɴᴅ ᴀɴᴏᴛʜᴇʀ", "user:send", EMOJI_ROCKET, "📤"), btn("ʜᴏᴍᴇ", "user:home", EMOJI_STAR, "🏠")]
+    back_btn = [btn("ᴏᴡɴᴇʀ ᴘᴀɴᴇʟ", "owner:home", EMOJI_GEAR, "🔙")] if is_owner(uid, load()) else [btn("sᴇɴᴅ ᴀɴᴏᴛʜᴇʀ", "user:send", EMOJI_ROCKET, "📤"), btn("ʜᴏᴍᴇ", "user:home", EMOJI_STAR, "🏠")]
 
     try:
         await progress_msg.edit_text(
-            f"{icon} <b>SMS Blast Result</b>{stopped_text}\n\n"
+            f"{icon} <b>SMS Blast Complete</b>{stopped_text}\n\n"
             f"{em(EMOJI_PHONE, '📞')} To: <code>{mask_number(number)}</code>\n"
-            f"{em(EMOJI_STAR, '💬')} Message: <code>{message[:50]}{'...' if len(message)>50 else ''}</code>\n"
             f"{em(EMOJI_CHECK, '✅')} Sent: <b>{sent_ok}</b>\n"
             f"{em(EMOJI_CROSS, '❌')} Failed: <b>{sent_fail}</b>\n"
-            f"{em(EMOJI_FIRE, '🔥')} APIs used: <b>{len(api_usage_delta)}</b>"
-            f"{duration_text}{credit_text}",
+            f"{em(EMOJI_GEAR, '⏱')} Time Taken: <b>{fmt_duration(duration)}</b>{credit_text}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_btn]),
             parse_mode="HTML"
         )
-    except Exception as e:
-        log.error(f"Failed to edit final progress message: {e}")
+    except Exception:
+        pass
 
 @R.callback_query(F.data == "user:stop_send")
 async def user_stop_send(cq: CallbackQuery, state: FSMContext):
@@ -3338,7 +3285,7 @@ async def owner_credits_add_uid(msg: Message, state: FSMContext):
 @R.message(S.add_credits_amount)
 async def owner_credits_add_amount(msg: Message, state: FSMContext):
     d = load()
-    if not is_owner(msg.from_user.id, d):
+    if not is_owner(uid, d):
         await state.clear()
         return
     try:
